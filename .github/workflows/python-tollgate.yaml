@@ -1,0 +1,221 @@
+name: Python Quality Checks
+
+on:
+  workflow_call:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    outputs:
+      tests_exist: ${{ steps.check_tests.outputs.tests_exist }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install pylint
+        run: pip install pylint
+
+      - name: Run Pylint linting
+        continue-on-error: true
+        run: |
+          if find . -name "*.py" -not -path "*/\.*" | grep -q .; then
+            find . -name "*.py" -not -path "*/\.*" -exec pylint {} + > pylint_output.txt 2>&1 || true
+          else
+            echo "No Python files found" > pylint_output.txt
+          fi
+          if [ ! -s pylint_output.txt ]; then
+            echo "No linting issues found" > pylint_output.txt
+          fi
+
+      - name: Upload Pylint output
+        uses: actions/upload-artifact@v4
+        with:
+          name: pylint-output
+          path: pylint_output.txt
+
+      - name: Check for tests
+        id: check_tests
+        run: |
+          if [ -d "tests" ] || [ -d "app/tests" ]; then
+            echo "tests_exist=true" >> $GITHUB_OUTPUT
+          else
+            echo "tests_exist=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Install dependencies
+        if: steps.check_tests.outputs.tests_exist == 'true'
+        run: |
+          if [ -f "pyproject.toml" ]; then
+            pip install poetry
+            poetry install
+          elif [ -f "requirements.txt" ]; then
+            pip install -r requirements.txt
+          fi
+          pip install pytest
+
+      - name: Run tests
+        if: steps.check_tests.outputs.tests_exist == 'true'
+        continue-on-error: true
+        run: |
+          if [ -f "pyproject.toml" ]; then
+            poetry run pytest --junitxml=test_output.xml || true
+          else
+            pytest --junitxml=test_output.xml || true
+          fi
+
+      - name: Upload test results
+        if: steps.check_tests.outputs.tests_exist == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: test_output.xml
+
+  version-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check version in pyproject.toml
+        run: |
+          if [ -f "pyproject.toml" ]; then
+            VERSION=$(grep '^version = ' pyproject.toml | sed -E 's/version = "([^"]+)"/\1/')
+            LATEST_TAG=$(git tag | sort -V | tail -n1 || echo "0.0.0")
+            
+            echo "Current version: ${VERSION}"
+            echo "Latest tag: ${LATEST_TAG}"
+            echo "${LATEST_TAG} -> ${VERSION}" > version_info.txt
+            
+            # Compare versions
+            if [ "$VERSION" = "$LATEST_TAG" ]; then
+              echo "ERROR: Version not bumped" > version_check.txt
+            elif [ "$(printf '%s\n' "$LATEST_TAG" "$VERSION" | sort -V | head -n1)" = "$LATEST_TAG" ]; then
+              echo "OK" > version_check.txt
+            else
+              echo "ERROR: Version is lower than latest tag" > version_check.txt
+            fi
+          else
+            echo "No pyproject.toml found - skipping version check" > version_info.txt
+            echo "SKIP" > version_check.txt
+          fi
+
+      - name: Upload version check
+        uses: actions/upload-artifact@v4
+        with:
+          name: version-check
+          path: |
+            version_info.txt
+            version_check.txt
+
+  comment-on-pr:
+    runs-on: ubuntu-latest
+    needs: [lint-and-test, version-check]
+    if: github.event_name == 'pull_request' || github.event_name == 'issue_comment'
+
+    steps:
+      - name: Download Pylint output
+        uses: actions/download-artifact@v4
+        with:
+          name: pylint-output
+          path: .
+
+      - name: Download test results
+        if: needs.lint-and-test.outputs.tests_exist == 'true'
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: test-results
+          path: .
+
+      - name: Download version check
+        uses: actions/download-artifact@v4
+        with:
+          name: version-check
+          path: .
+
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let pylintOutput = '';
+            let testOutput = '';
+            let versionOutput = '';
+            let failWorkflow = false;
+
+            // Read Pylint output
+            if (fs.existsSync('pylint_output.txt')) {
+              const rawPylint = fs.readFileSync('pylint_output.txt', 'utf-8').trim();
+              if (rawPylint && !rawPylint.includes('No linting issues found')) {
+                // Extract score if available
+                const scoreMatch = rawPylint.match(/Your code has been rated at ([\d.]+)\/10/);
+                const score = scoreMatch ? scoreMatch[1] : 'N/A';
+                pylintOutput = `**Pylint:** Score ${score}/10 ${parseFloat(score) >= 8 ? '✅' : '⚠️'}\n<details>\n<summary>Details</summary>\n\n\`\`\`\n${rawPylint}\n\`\`\`\n</details>`;
+                if (parseFloat(score) < 6) failWorkflow = true;
+              } else {
+                pylintOutput = '**Pylint:** No issues found ✅';
+              }
+            }
+
+            // Read test results
+            if ('${{ needs.lint-and-test.outputs.tests_exist }}' === 'true') {
+              if (fs.existsSync('test_output.xml')) {
+                const testResults = fs.readFileSync('test_output.xml', 'utf-8');
+                const testsMatch = testResults.match(/tests="(\d+)"/);
+                const failureMatch = testResults.match(/failures="(\d+)"/);
+                const errorMatch = testResults.match(/errors="(\d+)"/);
+                
+                const totalTests = testsMatch ? parseInt(testsMatch[1]) : 0;
+                const failures = failureMatch ? parseInt(failureMatch[1]) : 0;
+                const errors = errorMatch ? parseInt(errorMatch[1]) : 0;
+                const passed = totalTests - failures - errors;
+                
+                if (failures === 0 && errors === 0) {
+                  testOutput = `**Tests:** ${passed} passed ✅`;
+                } else {
+                  testOutput = `**Tests:** ${passed} passed, ${failures} failed, ${errors} errors ❌`;
+                  failWorkflow = true;
+                }
+              } else {
+                testOutput = '**Tests:** Test execution failed ❌';
+                failWorkflow = true;
+              }
+            } else {
+              testOutput = '**Tests:** No test directory found ⚠️';
+            }
+
+            // Read version check
+            if (fs.existsSync('version_check.txt') && fs.existsSync('version_info.txt')) {
+              const versionCheck = fs.readFileSync('version_check.txt', 'utf-8').trim();
+              const versionInfo = fs.readFileSync('version_info.txt', 'utf-8').trim();
+              
+              if (versionCheck === 'OK') {
+                versionOutput = `**Version:** ${versionInfo} ✅`;
+              } else if (versionCheck === 'SKIP') {
+                versionOutput = `**Version:** ${versionInfo} ⚠️`;
+              } else {
+                versionOutput = `**Version:** ${versionInfo} - ${versionCheck} ❌`;
+                failWorkflow = true;
+              }
+            }
+
+            const commentBody = `## 🔍 Code Quality Report\n\n${pylintOutput}\n\n${testOutput}\n\n${versionOutput}`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: commentBody
+            });
+
+            if (failWorkflow) {
+              core.setFailed('Code quality issues found');
+            }
