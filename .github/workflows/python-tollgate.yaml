@@ -2,6 +2,12 @@ name: Python Quality Checks
 
 on:
   workflow_call:
+    inputs:
+      service-specific-input:
+        description: "Name of the service to run tollgate on"
+        required: false
+        default: "python-service"
+        type: string
 
 jobs:
   lint-and-test:
