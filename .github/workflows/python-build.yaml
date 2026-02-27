@@ -39,6 +39,10 @@ jobs:
           IMAGE_NAME="${{ inputs.service-specific-input }}"
           echo "image_name=${IMAGE_NAME}" >> $GITHUB_ENV
 
+          # Convert repository owner to lowercase for Docker
+          REPO_OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "repo_owner=${REPO_OWNER}" >> $GITHUB_ENV
+
           # Extract version from pyproject.toml
           VERSION=$(grep '^version = ' pyproject.toml | sed -E 's/version = "([^"]+)"/\1/')
           echo "image_tag=${VERSION}" >> $GITHUB_ENV
@@ -47,7 +51,7 @@ jobs:
 
       - name: Build and push Docker image
         run: |
-          IMAGE="${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.image_name }}"
+          IMAGE="${{ env.REGISTRY }}/${{ env.repo_owner }}/${{ env.image_name }}"
           docker build -t ${IMAGE}:${{ env.image_tag }} .
           docker push ${IMAGE}:${{ env.image_tag }}
 
