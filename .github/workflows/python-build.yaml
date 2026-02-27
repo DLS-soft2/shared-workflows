@@ -5,7 +5,8 @@ on:
     inputs:
       service-specific-input:
         description: "Name of the service/image to build"
-        required: true
+        required: false
+        default: "python-service"
         type: string
 
 env:
