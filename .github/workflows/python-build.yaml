@@ -58,3 +58,26 @@ jobs:
           # Also tag as 'latest'
           docker tag ${IMAGE}:${{ env.image_tag }} ${IMAGE}:latest
           docker push ${IMAGE}:latest
+
+      - name: Check if tag exists
+        id: check_tag
+        run: |
+          git fetch --tags
+          if git rev-parse "refs/tags/${{ env.image_tag }}" > /dev/null 2>&1; then
+            echo "tag_exists=true" >> $GITHUB_ENV
+          else
+            echo "tag_exists=false" >> $GITHUB_ENV
+          fi
+
+      - name: Create tag and GitHub Release
+        if: github.ref == 'refs/heads/main' && env.tag_exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Configure Git
+          git config --global user.name "${{ github.actor }}"
+          git config --global user.email "${{ github.actor }}@users.noreply.github.com"
+
+          # Create and push the tag
+          git tag -a "${{ env.image_tag }}" -m "Release version ${{ env.image_tag }}"
+          git push origin "${{ env.image_tag }}"
