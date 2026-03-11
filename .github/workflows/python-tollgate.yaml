@@ -24,8 +24,15 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Install pylint
-        run: pip install pylint
+      - name: Install dependencies
+        run: |
+          pip install pylint
+          if [ -f "pyproject.toml" ]; then
+            pip install poetry
+            poetry install --no-interaction --no-ansi
+          elif [ -f "requirements.txt" ]; then
+            pip install -r requirements.txt
+          fi
 
       - name: Run Pylint linting
         continue-on-error: true
