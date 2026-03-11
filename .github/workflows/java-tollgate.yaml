@@ -1,4 +1,4 @@
-name: Python Quality Checks
+name: Java Quality Checks
 
 on:
   workflow_call:
@@ -6,7 +6,7 @@ on:
       service-specific-input:
         description: "Name of the service to run tollgate on"
         required: false
-        default: "python-service"
+        default: "java-service"
         type: string
 
 jobs:
@@ -19,67 +19,54 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Set up Java
+        uses: actions/setup-java@v4
         with:
-          python-version: "3.13"
+          distribution: "temurin"
+          java-version: "21"
+          cache: "maven"
 
-      - name: Install dependencies
-        run: |
-          pip install pylint
-          if [ -f "pyproject.toml" ]; then
-            pip install poetry
-            poetry install --no-interaction --no-ansi
-          elif [ -f "requirements.txt" ]; then
-            pip install -r requirements.txt
-          fi
-
-      - name: Run Pylint linting
+      - name: Run Checkstyle linting
         continue-on-error: true
         run: |
-          if find . -name "*.py" -not -path "*/\.*" | grep -q .; then
-            find . -name "*.py" -not -path "*/\.*" -exec pylint {} + > pylint_output.txt 2>&1 || true
+          if [ -f "pom.xml" ]; then
+            mvn checkstyle:check -q > checkstyle_output.txt 2>&1 || true
+            # If checkstyle report exists, extract violation count
+            if [ -f "target/checkstyle-result.xml" ]; then
+              VIOLATIONS=$(grep -c "<error " target/checkstyle-result.xml || echo "0")
+              echo "Checkstyle violations: ${VIOLATIONS}" >> checkstyle_output.txt
+            fi
           else
-            echo "No Python files found" > pylint_output.txt
+            echo "No pom.xml found — skipping linting" > checkstyle_output.txt
           fi
-          if [ ! -s pylint_output.txt ]; then
-            echo "No linting issues found" > pylint_output.txt
+          if [ ! -s checkstyle_output.txt ]; then
+            echo "No linting issues found" > checkstyle_output.txt
           fi
 
-      - name: Upload Pylint output
+      - name: Upload Checkstyle output
         uses: actions/upload-artifact@v4
         with:
-          name: pylint-output
-          path: pylint_output.txt
+          name: checkstyle-output
+          path: checkstyle_output.txt
 
       - name: Check for tests
         id: check_tests
         run: |
-          if [ -d "tests" ] || [ -d "app/tests" ]; then
+          if find . -path "*/src/test/java/*.java" | grep -q .; then
             echo "tests_exist=true" >> $GITHUB_OUTPUT
           else
             echo "tests_exist=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Install dependencies
-        if: steps.check_tests.outputs.tests_exist == 'true'
-        run: |
-          if [ -f "pyproject.toml" ]; then
-            pip install poetry
-            poetry install
-          elif [ -f "requirements.txt" ]; then
-            pip install -r requirements.txt
-          fi
-          pip install pytest
-
       - name: Run tests
         if: steps.check_tests.outputs.tests_exist == 'true'
         continue-on-error: true
         run: |
-          if [ -f "pyproject.toml" ]; then
-            poetry run pytest --junitxml=test_output.xml || true
-          else
-            pytest --junitxml=test_output.xml || true
+          mvn test -q > /dev/null 2>&1 || true
+          # Find surefire test report
+          if find . -path "*/surefire-reports/TEST-*.xml" | grep -q .; then
+            # Merge all test reports into one summary
+            cat target/surefire-reports/TEST-*.xml > test_output.xml 2>/dev/null || true
           fi
 
       - name: Upload test results
@@ -87,7 +74,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: test-results
-          path: test_output.xml
+          path: target/surefire-reports/
 
   version-check:
     runs-on: ubuntu-latest
@@ -97,16 +84,23 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Check version in pyproject.toml
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "21"
+          cache: "maven"
+
+      - name: Check version in pom.xml
         run: |
-          if [ -f "pyproject.toml" ]; then
-            VERSION=$(grep '^version = ' pyproject.toml | sed -E 's/version = "([^"]+)"/\1/')
+          if [ -f "pom.xml" ]; then
+            VERSION=$(mvn help:evaluate -Dexpression=project.version -q -DforceStdout)
             LATEST_TAG=$(git tag | sort -V | tail -n1 || echo "0.0.0")
-            
+
             echo "Current version: ${VERSION}"
             echo "Latest tag: ${LATEST_TAG}"
             echo "${LATEST_TAG} -> ${VERSION}" > version_info.txt
-            
+
             # Compare versions
             if [ "$VERSION" = "$LATEST_TAG" ]; then
               echo "ERROR: Version not bumped" > version_check.txt
@@ -116,7 +110,7 @@ jobs:
               echo "ERROR: Version is lower than latest tag" > version_check.txt
             fi
           else
-            echo "No pyproject.toml found - skipping version check" > version_info.txt
+            echo "No pom.xml found — skipping version check" > version_info.txt
             echo "SKIP" > version_check.txt
           fi
 
@@ -134,10 +128,10 @@ jobs:
     if: github.event_name == 'pull_request' || github.event_name == 'issue_comment'
 
     steps:
-      - name: Download Pylint output
+      - name: Download Checkstyle output
         uses: actions/download-artifact@v4
         with:
-          name: pylint-output
+          name: checkstyle-output
           path: .
 
       - name: Download test results
@@ -146,7 +140,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: test-results
-          path: .
+          path: ./surefire-reports
 
       - name: Download version check
         uses: actions/download-artifact@v4
@@ -159,42 +153,45 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            let pylintOutput = '';
+            let lintOutput = '';
             let testOutput = '';
             let versionOutput = '';
             let failWorkflow = false;
 
-            // Read Pylint output
-            if (fs.existsSync('pylint_output.txt')) {
-              const rawPylint = fs.readFileSync('pylint_output.txt', 'utf-8').trim();
-              if (rawPylint && !rawPylint.includes('No linting issues found')) {
-                // Extract score if available
-                const scoreMatch = rawPylint.match(/Your code has been rated at ([\d.]+)\/10/);
-                const score = scoreMatch ? scoreMatch[1] : 'N/A';
-                pylintOutput = `**Pylint:** Score ${score}/10 ${parseFloat(score) >= 8 ? '✅' : '⚠️'}\n<details>\n<summary>Details</summary>\n\n\`\`\`\n${rawPylint}\n\`\`\`\n</details>`;
-                if (parseFloat(score) < 6) failWorkflow = true;
+            // Read Checkstyle output
+            if (fs.existsSync('checkstyle_output.txt')) {
+              const rawLint = fs.readFileSync('checkstyle_output.txt', 'utf-8').trim();
+              if (rawLint.includes('No linting issues found') || rawLint.includes('No pom.xml')) {
+                lintOutput = '**Checkstyle:** No issues found ✅';
               } else {
-                pylintOutput = '**Pylint:** No issues found ✅';
+                const violationMatch = rawLint.match(/Checkstyle violations: (\d+)/);
+                const count = violationMatch ? violationMatch[1] : 'unknown';
+                lintOutput = `**Checkstyle:** ${count} violations ⚠️\n<details>\n<summary>Details</summary>\n\n\`\`\`\n${rawLint}\n\`\`\`\n</details>`;
               }
             }
 
             // Read test results
             if ('${{ needs.lint-and-test.outputs.tests_exist }}' === 'true') {
-              if (fs.existsSync('test_output.xml')) {
-                const testResults = fs.readFileSync('test_output.xml', 'utf-8');
-                const testsMatch = testResults.match(/tests="(\d+)"/);
-                const failureMatch = testResults.match(/failures="(\d+)"/);
-                const errorMatch = testResults.match(/errors="(\d+)"/);
-                
-                const totalTests = testsMatch ? parseInt(testsMatch[1]) : 0;
-                const failures = failureMatch ? parseInt(failureMatch[1]) : 0;
-                const errors = errorMatch ? parseInt(errorMatch[1]) : 0;
-                const passed = totalTests - failures - errors;
-                
-                if (failures === 0 && errors === 0) {
+              const reportDir = './surefire-reports';
+              if (fs.existsSync(reportDir)) {
+                const files = fs.readdirSync(reportDir).filter(f => f.startsWith('TEST-') && f.endsWith('.xml'));
+                let totalTests = 0, totalFailures = 0, totalErrors = 0;
+
+                for (const file of files) {
+                  const content = fs.readFileSync(`${reportDir}/${file}`, 'utf-8');
+                  const tests = content.match(/tests="(\d+)"/);
+                  const failures = content.match(/failures="(\d+)"/);
+                  const errors = content.match(/errors="(\d+)"/);
+                  totalTests += tests ? parseInt(tests[1]) : 0;
+                  totalFailures += failures ? parseInt(failures[1]) : 0;
+                  totalErrors += errors ? parseInt(errors[1]) : 0;
+                }
+
+                const passed = totalTests - totalFailures - totalErrors;
+                if (totalFailures === 0 && totalErrors === 0) {
                   testOutput = `**Tests:** ${passed} passed ✅`;
                 } else {
-                  testOutput = `**Tests:** ${passed} passed, ${failures} failed, ${errors} errors ❌`;
+                  testOutput = `**Tests:** ${passed} passed, ${totalFailures} failed, ${totalErrors} errors ❌`;
                   failWorkflow = true;
                 }
               } else {
@@ -209,7 +206,7 @@ jobs:
             if (fs.existsSync('version_check.txt') && fs.existsSync('version_info.txt')) {
               const versionCheck = fs.readFileSync('version_check.txt', 'utf-8').trim();
               const versionInfo = fs.readFileSync('version_info.txt', 'utf-8').trim();
-              
+
               if (versionCheck === 'OK') {
                 versionOutput = `**Version:** ${versionInfo} ✅`;
               } else if (versionCheck === 'SKIP') {
@@ -220,7 +217,7 @@ jobs:
               }
             }
 
-            const commentBody = `## 🔍 Code Quality Report\n\n${pylintOutput}\n\n${testOutput}\n\n${versionOutput}`;
+            const commentBody = `## 🔍 Code Quality Report\n\n${lintOutput}\n\n${testOutput}\n\n${versionOutput}`;
 
             github.rest.issues.createComment({
               issue_number: context.issue.number,
