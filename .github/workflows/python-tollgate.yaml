@@ -37,7 +37,9 @@ jobs:
       - name: Run Pylint linting
         continue-on-error: true
         run: |
-          if find . -name "*.py" -not -path "*/\.*" | grep -q .; then
+          if [ -f "pyproject.toml" ] && [ -d "app" ]; then
+            poetry run pylint app/ > pylint_output.txt 2>&1 || true
+          elif find . -name "*.py" -not -path "*/\.*" | grep -q .; then
             find . -name "*.py" -not -path "*/\.*" -exec pylint {} + > pylint_output.txt 2>&1 || true
           else
             echo "No Python files found" > pylint_output.txt
