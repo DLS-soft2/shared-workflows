@@ -81,3 +81,9 @@ jobs:
           # Create and push the tag
           git tag -a "${{ env.image_tag }}" -m "Release version ${{ env.image_tag }}"
           git push origin "${{ env.image_tag }}"
+
+          # Create GitHub Release
+          gh release create "${{ env.image_tag }}" \
+            --title "Release ${{ env.image_tag }}" \
+            --notes "Docker image: \`ghcr.io/${{ env.repo_owner }}/${{ env.image_name }}:${{ env.image_tag }}\`" \
+            --latest
